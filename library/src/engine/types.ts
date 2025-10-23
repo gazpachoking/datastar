@@ -23,6 +23,7 @@ export type ActionContext = {
   el: HTMLOrSVG
   evt?: Event
   error: ErrorFn
+  cleanups: Map<string, () => void>
 }
 
 export type RequirementType = 'allowed' | 'must' | 'denied' | 'exclusive'

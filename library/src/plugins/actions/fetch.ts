@@ -12,13 +12,11 @@ import type {
 } from '@engine/types'
 import { kebab } from '@utils/text'
 
-const fetchAbortControllers = new WeakMap<HTMLOrSVG, AbortController>()
-
 const createHttpMethod = (name: string, method: string): void =>
   action({
     name,
     apply: async (
-      { el, evt, error },
+      { el, evt, error, cleanups },
       url: string,
       {
         selector,
@@ -37,192 +35,164 @@ const createHttpMethod = (name: string, method: string): void =>
         requestCancellation instanceof AbortController
           ? requestCancellation
           : new AbortController()
-      const isDisabled = requestCancellation === 'disabled'
-      if (!isDisabled) {
-        const oldController = fetchAbortControllers.get(el)
-        if (oldController) {
-          oldController.abort()
+      if (requestCancellation === 'auto') {
+
+        cleanups.get('action-fetch')?.()
+        cleanups.set('action-fetch', async () => {
+          controller.abort()
           // wait one tick for FINISHED to fire
-          await Promise.resolve()
-        }
+          await Promise.resolve()})
       }
 
-      if (!isDisabled && !(requestCancellation instanceof AbortController)) {
-        fetchAbortControllers.set(el, controller)
-      }
+      let cleanupFn = null
 
       try {
-        const observer = new MutationObserver((mutations) => {
-          for (const mutation of mutations) {
-            for (const removed of mutation.removedNodes) {
-              if (removed === el) {
-                controller.abort()
-                cleanupFn()
-              }
-            }
-          }
-        })
-        if (el.parentNode) {
-          observer.observe(el.parentNode, { childList: true })
+        if (!url?.length) {
+          throw error('FetchNoUrlProvided', { action })
         }
 
-        let cleanupFn = () => {
-          observer.disconnect()
+        const initialHeaders: Record<string, any> = {
+          Accept: 'text/event-stream, text/html, application/json',
+          'Datastar-Request': true,
         }
+        if (contentType === 'json') {
+          initialHeaders['Content-Type'] = 'application/json'
+        }
+        const headers = Object.assign({}, initialHeaders, userHeaders)
+
+        // We ignore the content-type header if using form data
+        // if missing the boundary will be set automatically
+
+        const req: FetchEventSourceInit = {
+          method,
+          headers,
+          openWhenHidden,
+          retryInterval,
+          retryScaler,
+          retryMaxWaitMs,
+          retryMaxCount,
+          signal: controller.signal,
+          onopen: async (response: Response) => {
+            if (response.status >= 400)
+              dispatchFetch(ERROR, el, { status: response.status.toString() })
+          },
+          onmessage: (evt) => {
+            if (!evt.event.startsWith('datastar')) return
+            const type = evt.event
+            const argsRawLines: Record<string, string[]> = {}
+
+            for (const line of evt.data.split('\n')) {
+              const i = line.indexOf(' ')
+              const k = line.slice(0, i)
+              const v = line.slice(i + 1)
+              ;(argsRawLines[k] ||= []).push(v)
+            }
+
+            const argsRaw = Object.fromEntries(
+              Object.entries(argsRawLines).map(([k, v]) => [k, v.join('\n')]),
+            )
+
+            dispatchFetch(type, el, argsRaw)
+          },
+          onerror: (error) => {
+            if (isWrongContent(error)) {
+              // don't retry if the content-type is wrong
+              throw error('FetchExpectedTextEventStream', { url })
+            }
+            // do nothing and it will retry
+            if (error) {
+              console.error(error.message)
+              dispatchFetch(RETRYING, el, { message: error.message })
+            }
+          },
+        }
+
+        const urlInstance = new URL(url, document.baseURI)
+        const queryParams = new URLSearchParams(urlInstance.search)
+
+        if (contentType === 'json') {
+          const res = JSON.stringify(filtered({ include, exclude }))
+          if (method === 'GET') {
+            queryParams.set('datastar', res)
+          } else {
+            req.body = res
+          }
+        } else if (contentType === 'form') {
+          const formEl = (
+            selector ? document.querySelector(selector) : el.closest('form')
+          ) as HTMLFormElement
+          if (!formEl) {
+            throw error('FetchFormNotFound', { action, selector })
+          }
+
+          // Validate the form
+          if (!formEl.checkValidity()) {
+            formEl.reportValidity()
+            return
+          }
+
+          // Collect the form data
+
+          const formData = new FormData(formEl)
+          let submitter = el as HTMLElement | null
+
+          if (el === formEl && evt instanceof SubmitEvent) {
+            // Get the submitter from the event
+            submitter = evt.submitter
+          } else {
+            // Prevent the form being submitted
+            const preventDefault = (evt: Event) => evt.preventDefault()
+            formEl.addEventListener('submit', preventDefault)
+            cleanupFn = () => {
+              formEl.removeEventListener('submit', preventDefault)
+            }
+          }
+
+          // Append the value of the form submitter if it is a button with a name
+          if (submitter instanceof HTMLButtonElement) {
+            const name = submitter.getAttribute('name')
+            if (name) formData.append(name, submitter.value)
+          }
+
+          const multipart =
+            formEl.getAttribute('enctype') === 'multipart/form-data'
+          // Leave the `Content-Type` header empty for multipart encoding so the browser can set it automatically with the correct boundary
+          if (!multipart) {
+            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+          }
+
+          const formParams = new URLSearchParams(formData as any)
+          if (method === 'GET') {
+            for (const [key, value] of formParams) {
+              queryParams.append(key, value)
+            }
+          } else if (multipart) {
+            req.body = formData
+          } else {
+            req.body = formParams
+          }
+        } else {
+          throw error('FetchInvalidContentType', { action, contentType })
+        }
+
+        dispatchFetch(STARTED, el, {})
+        urlInstance.search = queryParams.toString()
 
         try {
-          if (!url?.length) {
-            throw error('FetchNoUrlProvided', { action })
+          await fetchEventSource(urlInstance.toString(), el, req)
+        } catch (e: any) {
+          if (!isWrongContent(e)) {
+            throw error('FetchFailed', { method, url, error: e.message })
           }
-
-          const initialHeaders: Record<string, any> = {
-            Accept: 'text/event-stream, text/html, application/json',
-            'Datastar-Request': true,
-          }
-          if (contentType === 'json') {
-            initialHeaders['Content-Type'] = 'application/json'
-          }
-          const headers = Object.assign({}, initialHeaders, userHeaders)
-
-          // We ignore the content-type header if using form data
-          // if missing the boundary will be set automatically
-
-          const req: FetchEventSourceInit = {
-            method,
-            headers,
-            openWhenHidden,
-            retryInterval,
-            retryScaler,
-            retryMaxWaitMs,
-            retryMaxCount,
-            signal: controller.signal,
-            onopen: async (response: Response) => {
-              if (response.status >= 400)
-                dispatchFetch(ERROR, el, { status: response.status.toString() })
-            },
-            onmessage: (evt) => {
-              if (!evt.event.startsWith('datastar')) return
-              const type = evt.event
-              const argsRawLines: Record<string, string[]> = {}
-
-              for (const line of evt.data.split('\n')) {
-                const i = line.indexOf(' ')
-                const k = line.slice(0, i)
-                const v = line.slice(i + 1)
-                ;(argsRawLines[k] ||= []).push(v)
-              }
-
-              const argsRaw = Object.fromEntries(
-                Object.entries(argsRawLines).map(([k, v]) => [k, v.join('\n')]),
-              )
-
-              dispatchFetch(type, el, argsRaw)
-            },
-            onerror: (error) => {
-              if (isWrongContent(error)) {
-                // don't retry if the content-type is wrong
-                throw error('FetchExpectedTextEventStream', { url })
-              }
-              // do nothing and it will retry
-              if (error) {
-                console.error(error.message)
-                dispatchFetch(RETRYING, el, { message: error.message })
-              }
-            },
-          }
-
-          const urlInstance = new URL(url, document.baseURI)
-          const queryParams = new URLSearchParams(urlInstance.search)
-
-          if (contentType === 'json') {
-            const res = JSON.stringify(filtered({ include, exclude }))
-            if (method === 'GET') {
-              queryParams.set('datastar', res)
-            } else {
-              req.body = res
-            }
-          } else if (contentType === 'form') {
-            const formEl = (
-              selector ? document.querySelector(selector) : el.closest('form')
-            ) as HTMLFormElement
-            if (!formEl) {
-              throw error('FetchFormNotFound', { action, selector })
-            }
-
-            // Validate the form
-            if (!formEl.checkValidity()) {
-              formEl.reportValidity()
-              cleanupFn()
-              return
-            }
-
-            // Collect the form data
-
-            const formData = new FormData(formEl)
-            let submitter = el as HTMLElement | null
-
-            if (el === formEl && evt instanceof SubmitEvent) {
-              // Get the submitter from the event
-              submitter = evt.submitter
-            } else {
-              // Prevent the form being submitted
-              const preventDefault = (evt: Event) => evt.preventDefault()
-              formEl.addEventListener('submit', preventDefault)
-              cleanupFn = () => {
-                formEl.removeEventListener('submit', preventDefault)
-                observer.disconnect()
-              }
-            }
-
-            // Append the value of the form submitter if it is a button with a name
-            if (submitter instanceof HTMLButtonElement) {
-              const name = submitter.getAttribute('name')
-              if (name) formData.append(name, submitter.value)
-            }
-
-            const multipart =
-              formEl.getAttribute('enctype') === 'multipart/form-data'
-            // Leave the `Content-Type` header empty for multipart encoding so the browser can set it automatically with the correct boundary
-            if (!multipart) {
-              headers['Content-Type'] = 'application/x-www-form-urlencoded'
-            }
-
-            const formParams = new URLSearchParams(formData as any)
-            if (method === 'GET') {
-              for (const [key, value] of formParams) {
-                queryParams.append(key, value)
-              }
-            } else if (multipart) {
-              req.body = formData
-            } else {
-              req.body = formParams
-            }
-          } else {
-            throw error('FetchInvalidContentType', { action, contentType })
-          }
-
-          dispatchFetch(STARTED, el, {})
-          urlInstance.search = queryParams.toString()
-
-          try {
-            await fetchEventSource(urlInstance.toString(), el, req)
-          } catch (e: any) {
-            if (!isWrongContent(e)) {
-              throw error('FetchFailed', { method, url, error: e.message })
-            }
-            // exit gracefully and do nothing if the content-type is wrong
-            // this can happen if the client is sending a request
-            // where no response is expected, and they haven’t
-            // set the content-type to text/event-stream
-          }
-        } finally {
-          dispatchFetch(FINISHED, el, {})
-          cleanupFn()
+          // exit gracefully and do nothing if the content-type is wrong
+          // this can happen if the client is sending a request
+          // where no response is expected, and they haven’t
+          // set the content-type to text/event-stream
         }
       } finally {
-        if (fetchAbortControllers.get(el) === controller) {
-          fetchAbortControllers.delete(el)
-        }
+        dispatchFetch(FINISHED, el, {})
+        cleanupFn?.()
+        cleanups.delete('action-fetch')
       }
     },
   })

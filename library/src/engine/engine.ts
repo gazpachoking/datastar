@@ -51,7 +51,7 @@ export const actions: Record<
 )
 
 // Map of cleanups keyed by element and attribute name
-const removals = new Map<HTMLOrSVG, Map<string, () => void>>()
+const removals = new Map<HTMLOrSVG, Map<string, Map<string, () => void>>>()
 
 const queuedAttributes: AttributePlugin[] = []
 const queuedAttributeNames = new Set<string>()
@@ -103,13 +103,13 @@ export const watcher = (plugin: WatcherPlugin): void => {
 
 const cleanupEls = (els: Iterable<HTMLOrSVG>): void => {
   for (const el of els) {
-    const cleanups = removals.get(el)
+    const attrCleanups = removals.get(el)
     // If removals has el, delete it and run all cleanup functions
     if (removals.delete(el)) {
-      for (const cleanup of cleanups!.values()) {
-        cleanup()
+      for (const cleanups of attrCleanups!.values()) {
+        cleanups.forEach(cleanup => cleanup())
       }
-      cleanups!.clear()
+      attrCleanups!.clear()
     }
   }
 }
@@ -166,10 +166,10 @@ const observe = (mutations: MutationRecord[]) => {
       const key = attributeName!.slice(5)
       const value = target.getAttribute(attributeName!)
       if (value === null) {
-        const cleanups = removals.get(target)
-        if (cleanups) {
-          cleanups.get(key)?.()
-          cleanups.delete(key)
+        const attrCleanups = removals.get(target)
+        if (attrCleanups) {
+          attrCleanups.get(key)?.forEach(cleanup => cleanup())
+          attrCleanups.delete(key)
         }
       } else {
         applyAttributePlugin(target, key, value)
@@ -260,6 +260,7 @@ const applyAttributePlugin = (
         }
       }
 
+      let cleanups = new Map()
       if (value) {
         let cachedRx: GenRxFn
         ctx.rx = (...args: any[]) => {
@@ -267,6 +268,7 @@ const applyAttributePlugin = (
             cachedRx = genRx(value, {
               returnsValue: plugin.returnsValue,
               argNames: plugin.argNames,
+              cleanups: cleanups,
             })
           }
           return cachedRx(el, ...args)
@@ -280,29 +282,31 @@ const applyAttributePlugin = (
 
       const cleanup = plugin.apply(ctx)
       if (cleanup) {
-        let cleanups = removals.get(el)
-        if (cleanups) {
-          cleanups.get(rawKey)?.()
-        } else {
-          cleanups = new Map()
-          removals.set(el, cleanups)
-        }
-        cleanups.set(rawKey, cleanup)
+        cleanups.set('attribute', cleanup)
       }
+      let attrCleanups = removals.get(el)
+      if (attrCleanups) {
+        attrCleanups.get(rawKey)?.forEach(cleanup => cleanup())
+      } else {
+        attrCleanups = new Map()
+        removals.set(el, attrCleanups)
+      }
+      attrCleanups.set(rawKey, cleanups)
     }
   }
 }
 
 type GenRxOptions = {
   returnsValue?: boolean
-  argNames?: string[]
+  argNames?: string[],
+  cleanups?: Map<string, () => void>
 }
 
 type GenRxFn = <T>(el: HTMLOrSVG, ...args: any[]) => T
 
 const genRx = (
   value: string,
-  { returnsValue = false, argNames = [] }: GenRxOptions = {},
+  { returnsValue = false, argNames = [], cleanups = new Map() }: GenRxOptions = {},
 ): GenRxFn => {
   let expr = ''
   if (returnsValue) {
@@ -408,6 +412,7 @@ const genRx = (
               el,
               evt,
               error: err,
+              cleanups,
             },
             ...args,
           )
