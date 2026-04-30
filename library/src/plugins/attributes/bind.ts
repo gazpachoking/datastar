@@ -94,29 +94,12 @@ const boundPath = (
     return signalName
   }
 
-  const signalNameKebab = key ? key : value!
-  const inputs = document.querySelectorAll(
-    `[${aliasedBind}\\:${CSS.escape(signalNameKebab)}],[${aliasedBind}="${CSS.escape(signalNameKebab)}"]`,
-  ) as NodeListOf<Element>
-
-  const paths: Paths = []
-  let i = 0
-  for (const input of inputs) {
-    // Missing proxy slots materialize as '', which breaks `ifMissing`.
-    paths.push([
-      `${signalName}.${i}`,
-      adapter.get(
-        input,
-        typeof (hasOwn(initialValue, i) ? initialValue[i] : undefined),
-      ),
-    ])
-    if (el === input) {
-      break
-    }
-    i++
+  const numBoundInputs = document.querySelectorAll(`[data-_ds_bound="${signalName}"]`).length
+  el.setAttribute('data-_ds_bound', signalName)
+  if (!hasOwn(initialValue, numBoundInputs)) {
+    mergePaths([[`${signalName}.${numBoundInputs}`, adapter.get(el, typeof (undefined))]])
   }
-  mergePaths(paths, { ifMissing: true })
-  return `${signalName}.${i}`
+  return `${signalName}.${numBoundInputs}`
 }
 
 attribute({
