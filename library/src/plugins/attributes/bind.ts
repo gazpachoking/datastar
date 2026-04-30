@@ -65,23 +65,12 @@ const boundPath = (
   initialValue: any,
 ) => {
   if (
-    initialValue === undefined &&
+    (initialValue === undefined || initialValue === empty) &&
     el instanceof HTMLInputElement &&
-    el.type === 'radio'
+    el.type === 'radio' &&
+    el.hasAttribute('checked')
   ) {
-    const signalNameKebab = key ? key : value!
-    const checked = [
-      ...document.querySelectorAll(
-        `[${aliasedBind}\\:${CSS.escape(signalNameKebab)}],[${aliasedBind}="${CSS.escape(signalNameKebab)}"]`,
-      ),
-    ].find(
-      (input): input is HTMLInputElement =>
-        input instanceof HTMLInputElement && input.checked,
-    )
-    // Missing radio binds adopt the checked option.
-    if (checked) {
-      mergePaths([[signalName, checked.value]], { ifMissing: true })
-    }
+    mergePaths([[signalName, el.value]])
   }
 
   if (
@@ -159,6 +148,8 @@ attribute({
           }
           break
         case 'radio':
+          // Uncheck the radio button before setting the name as it can affect other radio buttons in the same group
+          el.checked = false
           if (!el.getAttribute('name')?.length) {
             el.setAttribute('name', signalName)
           }
